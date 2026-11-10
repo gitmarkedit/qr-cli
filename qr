@@ -5,7 +5,7 @@
 
 set -eo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 QRTOOL="/opt/homebrew/bin/qrtool"
 TMP_PNG="/tmp/qr_code_latest.png"
 
@@ -97,6 +97,16 @@ run_arrow_menu() {
         elif [[ "$key" =~ ^[1-9]$ ]] && [ "$key" -le "$total" ]; then
             cur=$key
             break
+        elif [[ "$key" == "c" ]] || [[ "$key" == "C" ]] || [[ "$key" == "с" ]] || [[ "$key" == "С" ]]; then
+            # Горячая клавиша c / с — выбрать первый пункт (копировать png)
+            cur=1
+            break
+        elif [[ "$key" == "t" ]] || [[ "$key" == "T" ]] || [[ "$key" == "е" ]] || [[ "$key" == "Е" ]]; then
+            # Горячая клавиша t / е — выбрать пункт копирования текста
+            if [ "$total" -ge 2 ]; then
+                cur=2
+                break
+            fi
         elif [[ "$key" == "k" ]]; then
             ((cur--))
             [ $cur -lt 1 ] && cur=$total
@@ -264,7 +274,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------------------------------------------------------
-# Меню без цифр и без цветных иконок
+# Главное интерактивное меню
 # ------------------------------------------------------------------------------
 
 if [ "$OPT_WIFI_MODE" = true ]; then
@@ -417,7 +427,7 @@ if [ -n "$OPT_SAVE_PATH" ]; then
     print "· сохранено: \033[32m$OPT_SAVE_PATH\033[0m"
 fi
 
-# Копирование в буфер обмена
+# Копирование в буфер обмена по аргументу -c
 if [ "$OPT_COPY_CLIPBOARD" = true ]; then
     if command -v osascript >/dev/null 2>&1; then
         osascript -e "set the clipboard to (read (POSIX file \"$TMP_PNG\") as «class PNGf»)" 2>/dev/null || true
@@ -426,7 +436,7 @@ if [ "$OPT_COPY_CLIPBOARD" = true ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# Отображение
+# Отображение QR-кода
 # ------------------------------------------------------------------------------
 print ""
 print "\033[90mданные: ${PAYLOAD_LEN} симв. | матрица: ${QR_COLS}×${QR_ROWS} | уровень: $(echo "$SELECTED_LEVEL" | tr '[:lower:]' '[:upper:]')\033[0m"
@@ -446,3 +456,37 @@ fi
 
 print -r -- "$QR_TEXT"
 print ""
+
+# ------------------------------------------------------------------------------
+# Действия после вывода: быстрое копирование в буфер
+# ------------------------------------------------------------------------------
+if [ -t 0 ] && [ -t 1 ] && [ "$OPT_COPY_CLIPBOARD" = false ]; then
+    print "действие:"
+    local -a post_items=(
+        "скопировать png в буфер (для вставки в чат)"
+        "скопировать текст в буфер (символы qr)"
+        "открыть в preview"
+        "выход"
+    )
+
+    action_idx=$(run_arrow_menu post_items)
+
+    case "$action_idx" in
+        "1")
+            if command -v osascript >/dev/null 2>&1; then
+                osascript -e "set the clipboard to (read (POSIX file \"$TMP_PNG\") as «class PNGf»)" 2>/dev/null || true
+                print "· png скопирован в буфер обмена (готов для cmd+v)"
+            fi
+            ;;
+        "2")
+            print -rn -- "$QR_TEXT" | pbcopy 2>/dev/null || true
+            print "· текст скопирован в буфер обмена"
+            ;;
+        "3")
+            open "$TMP_PNG" 2>/dev/null || true
+            print "· открыто в preview"
+            ;;
+        *)
+            ;;
+    esac
+fi
