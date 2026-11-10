@@ -1,0 +1,448 @@
+#!/usr/bin/env zsh
+# ==============================================================================
+# qr - Fast, high-capacity, interactive QR code generator for macOS (powered by Rust)
+# ==============================================================================
+
+set -eo pipefail
+
+VERSION="2.5.0"
+QRTOOL="/opt/homebrew/bin/qrtool"
+TMP_PNG="/tmp/qr_code_latest.png"
+
+# Проверка наличия движка qrtool
+if [ ! -x "$QRTOOL" ]; then
+    if command -v qrtool >/dev/null 2>&1; then
+        QRTOOL="$(command -v qrtool)"
+    else
+        print -u2 "ошибка: qrtool не найден. Установите: brew install qrtool"
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# Справка по флагам (для вызова через qr --help)
+# ------------------------------------------------------------------------------
+show_help() {
+    cat << EOF
+qr — генератор QR-кодов в терминале macOS (движок Rust qrtool)
+
+Использование:
+  qr                 Меню со стрелками ↑ / ↓ (без цифр)
+  qr [ТЕКСТ]         Быстрая генерация по переданному тексту или ссылке
+
+Опции:
+  -w, --wifi         Мастер создания QR-кода для подключения к Wi-Fi
+  -c, --copy         Скопировать готовое PNG-изображение в буфер обмена Mac
+  -s, --save [ПУТЬ]  Сохранить QR-код в PNG-файл (по умолчанию: ~/Desktop/qr.png)
+  -g, --gui          Принудительно открыть QR-код в окне «Просмотр» (Preview)
+  -t, --term         Выводить только в терминал (не открывать окно Preview)
+  -i, --invert       Инвертировать цвета (для светлых тем оформления терминала)
+  -m, --margin <N>   Ширина рамки в модулях (по умолчанию: 2)
+  -l, --level <L>    Уровень коррекции: l (7%), m (15%), q (25%), h (30%)
+  -h, --help         Показать эту справку
+  -v, --version      Показать версию
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Минималистичное меню со стрелочками (фигуры и точки в тон текста)
+# ------------------------------------------------------------------------------
+run_arrow_menu() {
+    local -a options=("${(@P)1}")
+    local cur=1
+    local total=${#options}
+    local key=""
+
+    # Восстанавливаем курсор при прерывании
+    trap 'printf "\033[?25h" >&2; exit 0' INT TERM
+
+    # Скрываем текстовый курсор
+    printf "\033[?25l" >&2
+
+    redraw_menu() {
+        for ((i=1; i<=total; i++)); do
+            if [ $i -eq $cur ]; then
+                printf "  \033[32m› • %s\033[0m\033[K\n" "${options[$i]}" >&2
+            else
+                printf "    \033[90m· %s\033[0m\033[K\n" "${options[$i]}" >&2
+            fi
+        done
+    }
+
+    redraw_menu
+
+    while true; do
+        read -k 1 -s key
+        if [[ "$key" == $'\033' ]]; then
+            read -k 2 -s -t 0.05 rest || rest=""
+            case "$rest" in
+                "[A"|"OA") # Стрелка ВВЕРХ
+                    ((cur--))
+                    [ $cur -lt 1 ] && cur=$total
+                    ;;
+                "[B"|"OB") # Стрелка ВНИЗ
+                    ((cur++))
+                    [ $cur -gt $total ] && cur=1
+                    ;;
+                "") # Клавиша ESC
+                    cur=0
+                    break
+                    ;;
+            esac
+        elif [[ "$key" == $'\n' ]] || [[ "$key" == $'\r' ]] || [[ "$key" == " " ]]; then
+            break
+        elif [[ "$key" == "q" ]] || [[ "$key" == "Q" ]] || [[ "$key" == $'\x03' ]]; then
+            cur=0
+            break
+        elif [[ "$key" =~ ^[1-9]$ ]] && [ "$key" -le "$total" ]; then
+            cur=$key
+            break
+        elif [[ "$key" == "k" ]]; then
+            ((cur--))
+            [ $cur -lt 1 ] && cur=$total
+        elif [[ "$key" == "j" ]]; then
+            ((cur++))
+            [ $cur -gt $total ] && cur=1
+        fi
+
+        printf "\033[%dA" "$total" >&2
+        redraw_menu
+    done
+
+    printf "\033[?25h" >&2
+    print "$cur"
+}
+
+# Чтение многострочного ввода из терминала без зависания
+read_multiline_input() {
+    local first_line=""
+    IFS= read -r first_line || return 0
+    local full_text="$first_line"
+    local next_line=""
+
+    while IFS= read -t 0.05 -r next_line; do
+        full_text="${full_text}"$'\n'"${next_line}"
+    done
+    print -r -- "$full_text"
+}
+
+# Очистка входных данных
+sanitize_input() {
+    local text="$1"
+    text=$(echo "$text" | tr -d '\r')
+
+    if [[ "$text" =~ ^([a-zA-Z0-9_-]+://|magnet:\?|WIFI:|tel:|mailto:|bitcoin:|data:) ]] || [[ "$text" =~ ^[A-Za-z0-9+/=_-]{50,}$ ]]; then
+        echo "$text" | tr -d '[:space:]'
+    else
+        echo "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+    fi
+}
+
+# Мастер создания Wi-Fi QR-кода
+generate_wifi_string() {
+    print -u2 ""
+    print -u2 "настройка wi-fi"
+    print -u2 "────────────────────────────────────────────"
+    printf "имя сети (ssid): " >&2
+    read -r ssid
+    if [ -z "$ssid" ]; then
+        print -u2 "ошибка: имя сети не может быть пустым."
+        exit 1
+    fi
+
+    printf "пароль (пусто, если сеть открытая): " >&2
+    read -r pass
+
+    local auth="WPA"
+    if [ -n "$pass" ]; then
+        print -u2 ""
+        print -u2 "тип защиты:"
+        local -a auth_options=(
+            "wpa / wpa2 / wpa3 (стандартный)"
+            "wep (устаревший)"
+        )
+        local auth_idx=$(run_arrow_menu auth_options)
+        if [ "$auth_idx" = "2" ]; then
+            auth="WEP"
+        fi
+    else
+        auth="nopass"
+    fi
+
+    print -u2 ""
+    print -u2 "скрытая сеть?"
+    local -a hidden_options=(
+        "нет (видимая сеть)"
+        "да (скрытый ssid)"
+    )
+    local hidden_idx=$(run_arrow_menu hidden_options)
+    local hidden=""
+    if [ "$hidden_idx" = "2" ]; then
+        hidden="H:true;"
+    fi
+
+    local safe_ssid=$(echo "$ssid" | sed -e 's/\\/\\\\/g' -e 's/;/\\;/g' -e 's/:/\\:/g' -e 's/"/\\"/g')
+    local safe_pass=$(echo "$pass" | sed -e 's/\\/\\\\/g' -e 's/;/\\;/g' -e 's/:/\\:/g' -e 's/"/\\"/g')
+
+    if [ "$auth" = "nopass" ]; then
+        print "WIFI:T:nopass;S:${safe_ssid};${hidden};"
+    else
+        print "WIFI:T:${auth};S:${safe_ssid};P:${safe_pass};${hidden};"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Разбор аргументов командной строки
+# ------------------------------------------------------------------------------
+
+OPT_COPY_CLIPBOARD=false
+OPT_SAVE_PATH=""
+OPT_FORCE_GUI=false
+OPT_FORCE_TERM=false
+OPT_INVERT=false
+OPT_MARGIN="2"
+OPT_LEVEL=""
+OPT_WIFI_MODE=false
+RAW_PAYLOAD=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--version)
+            print "qr $VERSION (using $($QRTOOL --version))"
+            exit 0
+            ;;
+        -w|--wifi)
+            OPT_WIFI_MODE=true
+            shift
+            ;;
+        -c|--copy)
+            OPT_COPY_CLIPBOARD=true
+            shift
+            ;;
+        -g|--gui)
+            OPT_FORCE_GUI=true
+            shift
+            ;;
+        -t|--term)
+            OPT_FORCE_TERM=true
+            shift
+            ;;
+        -i|--invert)
+            OPT_INVERT=true
+            shift
+            ;;
+        -m|--margin)
+            OPT_MARGIN="$2"
+            shift 2
+            ;;
+        -l|--level)
+            OPT_LEVEL="$2"
+            shift 2
+            ;;
+        -s|--save)
+            if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+                OPT_SAVE_PATH="$2"
+                shift 2
+            else
+                OPT_SAVE_PATH="${HOME}/Desktop/qr.png"
+                shift 1
+            fi
+            ;;
+        *)
+            if [ -z "$RAW_PAYLOAD" ]; then
+                RAW_PAYLOAD="$1"
+            else
+                RAW_PAYLOAD="$RAW_PAYLOAD $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------------------------
+# Меню без цифр и без цветных иконок
+# ------------------------------------------------------------------------------
+
+if [ "$OPT_WIFI_MODE" = true ]; then
+    RAW_PAYLOAD=$(generate_wifi_string)
+elif [ -n "$RAW_PAYLOAD" ]; then
+    : # Передано напрямую через аргументы
+elif [ ! -t 0 ]; then
+    RAW_PAYLOAD=$(cat)
+else
+    clip_content=$(pbpaste 2>/dev/null || true)
+    clip_cleaned=$(sanitize_input "$clip_content")
+
+    print ""
+    print "qr \033[90m(macos • rust)\033[0m"
+    print "────────────────────────────────────────────"
+
+    if [ -n "$clip_cleaned" ]; then
+        len=${#clip_cleaned}
+        preview="${clip_cleaned:0:50}"
+        [ $len -gt 50 ] && preview="${preview}..."
+
+        print "буфер: \033[36m${preview}\033[0m \033[90m(${len} симв.)\033[0m"
+        print "────────────────────────────────────────────"
+
+        local -a menu_items=(
+            "ссылка из буфера"
+            "ввести вручную"
+            "сеть wi-fi"
+            "скопировать png в буфер"
+            "выход"
+        )
+
+        selected_idx=$(run_arrow_menu menu_items)
+
+        case "$selected_idx" in
+            "1")
+                RAW_PAYLOAD="$clip_cleaned"
+                ;;
+            "2")
+                print ""
+                print "вставьте текст или ссылку (нажмите enter):"
+                RAW_PAYLOAD=$(read_multiline_input)
+                ;;
+            "3")
+                RAW_PAYLOAD=$(generate_wifi_string)
+                ;;
+            "4")
+                RAW_PAYLOAD="$clip_cleaned"
+                OPT_COPY_CLIPBOARD=true
+                ;;
+            *)
+                print "выход."
+                exit 0
+                ;;
+        esac
+    else
+        local -a menu_items=(
+            "ввести вручную"
+            "сеть wi-fi"
+            "выход"
+        )
+
+        selected_idx=$(run_arrow_menu menu_items)
+
+        case "$selected_idx" in
+            "1")
+                print ""
+                print "вставьте текст или ссылку (нажмите enter):"
+                RAW_PAYLOAD=$(read_multiline_input)
+                ;;
+            "2")
+                RAW_PAYLOAD=$(generate_wifi_string)
+                ;;
+            *)
+                print "выход."
+                exit 0
+                ;;
+        esac
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# Очистка и санитизация
+# ------------------------------------------------------------------------------
+PAYLOAD=$(sanitize_input "$RAW_PAYLOAD")
+
+if [ -z "$PAYLOAD" ]; then
+    print -u2 "ошибка: пустой ввод."
+    exit 1
+fi
+
+PAYLOAD_LEN=${#PAYLOAD}
+
+# Проверка физического предела стандарта QR Code (Version 40 Level L = 2953 байта)
+if [ "$PAYLOAD_LEN" -gt 2953 ]; then
+    print -u2 ""
+    print -u2 "ошибка: объем данных (${PAYLOAD_LEN} симв.) превышает лимит стандарта qr (2953 байта)."
+    print -u2 "совет: для больших конфигураций используйте ссылку на подписку (url) вместо полного base64."
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Подбор уровня коррекции ошибок
+# ------------------------------------------------------------------------------
+SELECTED_LEVEL="$OPT_LEVEL"
+if [ -z "$SELECTED_LEVEL" ]; then
+    if [ "$PAYLOAD_LEN" -gt 900 ]; then
+        SELECTED_LEVEL="l"
+    else
+        if echo "$PAYLOAD" | "$QRTOOL" encode -l m -m "$OPT_MARGIN" -t png -o /dev/null 2>/dev/null; then
+            SELECTED_LEVEL="m"
+        else
+            SELECTED_LEVEL="l"
+        fi
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# Генерация QR-кода
+# ------------------------------------------------------------------------------
+TERM_TYPE="unicode"
+if [ "$OPT_INVERT" = true ]; then
+    TERM_TYPE="unicode-invert"
+fi
+
+QR_TEXT=$(echo "$PAYLOAD" | "$QRTOOL" encode -l "$SELECTED_LEVEL" -m "$OPT_MARGIN" -t "$TERM_TYPE" 2>/dev/null || true)
+
+if [ -z "$QR_TEXT" ]; then
+    SELECTED_LEVEL="l"
+    QR_TEXT=$(echo "$PAYLOAD" | "$QRTOOL" encode -l "$SELECTED_LEVEL" -m "$OPT_MARGIN" -t "$TERM_TYPE" 2>/dev/null || true)
+fi
+
+if [ -z "$QR_TEXT" ]; then
+    print -u2 "ошибка: не удалось закодировать данные."
+    exit 1
+fi
+
+FIRST_LINE=$(echo "$QR_TEXT" | head -n 1)
+QR_COLS=${#FIRST_LINE}
+QR_ROWS=$(echo "$QR_TEXT" | wc -l | tr -d ' ')
+TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
+
+# Сохраняем во временный PNG
+echo "$PAYLOAD" | "$QRTOOL" encode -l "$SELECTED_LEVEL" -m 4 -s 10 -t png -o "$TMP_PNG" 2>/dev/null || true
+
+# Сохранение в файл
+if [ -n "$OPT_SAVE_PATH" ]; then
+    cp "$TMP_PNG" "$OPT_SAVE_PATH"
+    print "· сохранено: \033[32m$OPT_SAVE_PATH\033[0m"
+fi
+
+# Копирование в буфер обмена
+if [ "$OPT_COPY_CLIPBOARD" = true ]; then
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "set the clipboard to (read (POSIX file \"$TMP_PNG\") as «class PNGf»)" 2>/dev/null || true
+        print "· png скопирован в буфер обмена (cmd+v)"
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# Отображение
+# ------------------------------------------------------------------------------
+print ""
+print "\033[90mданные: ${PAYLOAD_LEN} симв. | матрица: ${QR_COLS}×${QR_ROWS} | уровень: $(echo "$SELECTED_LEVEL" | tr '[:lower:]' '[:upper:]')\033[0m"
+
+IS_OVERSIZED=false
+if [ "$QR_COLS" -gt "$TERM_COLS" ] || [ "$QR_ROWS" -gt "$TERM_ROWS" ]; then
+    IS_OVERSIZED=true
+fi
+
+if [ "$OPT_FORCE_GUI" = true ] || { [ "$IS_OVERSIZED" = true ] && [ "$OPT_FORCE_TERM" = false ]; }; then
+    if [ "$IS_OVERSIZED" = true ]; then
+        print "\033[33m· qr-код (${QR_COLS} симв.) шире окна терминала (${TERM_COLS} симв.)\033[0m"
+    fi
+    print "· открываю в окне «просмотр» (preview)..."
+    open "$TMP_PNG" 2>/dev/null || true
+fi
+
+print -r -- "$QR_TEXT"
+print ""
